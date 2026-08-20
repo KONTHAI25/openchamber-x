@@ -16,10 +16,13 @@ import { isVSCodeRuntime } from "@/lib/desktop"
 import { isMobileSurfaceRuntime } from "@/lib/runtimeSurface"
 import { normalizePath } from "@/lib/pathNormalization"
 import { startSessionLoadPerformanceEvent } from "./session-load-performance"
+import { createRuntimeAgentClient } from "@/lib/agents/client"
+import { decodeCodexSessionId, isCodexSessionId } from "@/lib/agents/opencode-compat"
 
 const SKIP_PARTS = new Set(["patch", "step-start", "step-finish"])
 const INITIAL_MESSAGE_PAGE_SIZE = 50
 const CONSTRAINED_INITIAL_MESSAGE_PAGE_SIZE = 30
+const agentClient = createRuntimeAgentClient()
 const HISTORY_MESSAGE_PAGE_SIZE = 100
 const INITIAL_PAGE_EXPANSION_LIMITS = [100, 150] as const
 const CONSTRAINED_INITIAL_PAGE_EXPANSION_LIMITS = [50, 80, 120] as const
@@ -580,6 +583,29 @@ export class SessionMessageLoader {
     let attempts = 0
     let recordCount = 0
     try {
+      if (isCodexSessionId(target.sessionID)) {
+        const threadId = decodeCodexSessionId(target.sessionID)
+        if (!threadId) throw new Error("Codex thread id could not be decoded")
+        attempts += 1
+        const snapshot = await agentClient.readThreadSnapshot({
+          backend: "codex",
+          directory: target.directory,
+          threadId,
+        })
+        if (!snapshot.ok) throw new Error(`thread/read failed: ${snapshot.error.message}`)
+        const records = snapshot.data.messages
+          .slice(before ? 0 : -limit)
+          .filter((record) => Boolean(record.info?.id))
+        recordCount = records.length
+        if (performance) performance.recordCount += recordCount
+        const session = sortMessagesChronologically(records.map((record) => stripMessageDiffSnapshots(record.info)))
+        const partsByMessageID = new Map<string, Part[]>()
+        for (const record of records) {
+          partsByMessageID.set(record.info.id, filterIdentifiedParts([...record.parts]))
+        }
+        finishPagePerformance("complete", { retryCount: 0, recordCount })
+        return { session, partsByMessageID, cursor: undefined, complete: true }
+      }
       const result = await retry(async () => {
         attempts += 1
         const response = await this.sdk.session.messages({

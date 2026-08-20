@@ -5,6 +5,8 @@ import type { AttachedFile } from './types/sessionTypes';
 import { updateDesktopSettings } from '@/lib/persistence';
 import { getRuntimeKey } from '@/lib/runtime-switch';
 import { normalizePath } from '@/lib/pathNormalization';
+import type { AgentBackend } from '@/lib/agents/contracts';
+import { isCodexSessionId } from '@/lib/agents/opencode-compat';
 
 export type FollowUpBehavior = 'steer' | 'queue';
 
@@ -57,6 +59,7 @@ export interface QueuedMessage {
 export type MessageQueueTarget = {
     runtimeKey: string;
     directory: string;
+    backend: AgentBackend;
     sessionId: string;
 };
 
@@ -67,18 +70,22 @@ export const createMessageQueueTarget = (
     sessionId: string,
     directory: string | null | undefined,
     runtimeKey: string = getRuntimeKey(),
+    backend: AgentBackend = isCodexSessionId(sessionId) ? 'codex' : 'opencode',
 ): MessageQueueTarget | null => {
     const normalizedDirectory = normalizePath(directory);
     if (!runtimeKey || !normalizedDirectory || !sessionId) return null;
-    return { runtimeKey, directory: normalizedDirectory, sessionId };
+    return { runtimeKey, directory: normalizedDirectory, backend, sessionId };
 };
 
 export const getMessageQueueKey = (target: MessageQueueTarget): string =>
-    `${target.runtimeKey}\n${target.directory}\n${target.sessionId}`;
+    `${target.runtimeKey}\n${target.directory}\n${target.backend}\n${target.sessionId}`;
 
 export const parseMessageQueueKey = (key: string): MessageQueueTarget | null => {
-    const [runtimeKey, directory, ...sessionParts] = key.split('\n');
-    return createMessageQueueTarget(sessionParts.join('\n'), directory, runtimeKey);
+    const [runtimeKey, directory, maybeBackend, ...sessionParts] = key.split('\n');
+    if (maybeBackend === 'opencode' || maybeBackend === 'codex') {
+        return createMessageQueueTarget(sessionParts.join('\n'), directory, runtimeKey, maybeBackend);
+    }
+    return createMessageQueueTarget([maybeBackend, ...sessionParts].join('\n'), directory, runtimeKey);
 };
 
 interface MessageQueueState {
@@ -126,8 +133,14 @@ type PersistedMessageQueueState = {
 export const migrateMessageQueueState = (persistedState: unknown, version: number): Partial<MessageQueueStore> => {
     const state = (persistedState ?? {}) as PersistedMessageQueueState;
     const legacyQueues = version < 2 ? (state.queuedMessages ?? {}) : {};
+    const queuedMessages = version < 2 ? {} : Object.fromEntries(
+        Object.entries(state.queuedMessages ?? {}).flatMap(([key, messages]) => {
+            const target = parseMessageQueueKey(key);
+            return target ? [[getMessageQueueKey(target), messages]] : [];
+        }),
+    );
     return {
-        queuedMessages: version < 2 ? {} : (state.queuedMessages ?? {}),
+        queuedMessages,
         quarantinedLegacyMessages: {
             ...(state.quarantinedLegacyMessages ?? {}),
             ...legacyQueues,
@@ -316,7 +329,7 @@ export const useMessageQueueStore = create<MessageQueueStore>()(
             }),
             {
                 name: 'message-queue-store',
-                version: 2,
+                version: 3,
                 storage: createDeferredSafeJSONStorage(),
                 partialize: (state) => ({
                     queuedMessages: state.queuedMessages,

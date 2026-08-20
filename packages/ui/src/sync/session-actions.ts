@@ -35,6 +35,12 @@ import { getStaleRunningToolMessageID } from "./materialization"
 import { normalizePath } from "@/lib/pathNormalization"
 import { mergeMessages } from "./optimistic"
 import { messagesBefore, messagesFrom } from "./message-ordering"
+import { createRuntimeAgentClient } from "@/lib/agents/client"
+import { decodeCodexReferenceId, isCodexSessionId } from "@/lib/agents/opencode-compat"
+import type { JsonObject, JsonValue } from "@/lib/agents/contracts"
+import type { QuestionInfo, QuestionRequest } from "@/types/question"
+
+type QuestionInfoWithCodexId = QuestionInfo & { id?: string }
 
 const MESSAGE_REFETCH_LIMIT = 100
 const SEND_CONFIRMATION_REFETCH_LIMIT = 30
@@ -52,6 +58,7 @@ const SEND_CONFIRMATION_RECONNECT_POLL_MS = 100
 const MESSAGE_REFETCH_SKIP_PARTS = new Set(["patch", "step-start", "step-finish"])
 const UNREVERT_REFETCH_ATTEMPTS = 3
 const UNREVERT_REFETCH_RETRY_MS = 150
+const agentClient = createRuntimeAgentClient()
 
 // Reference set by SyncProvider — allows actions to access SDK and stores
 let _sdk: OpencodeClient | null = null
@@ -1477,12 +1484,13 @@ async function fetchRecentSendConfirmationRecords(
   for (let attempt = 0; attempt < SEND_CONFIRMATION_REFETCH_ATTEMPTS; attempt += 1) {
     if (attempt > 0) await wait(SEND_CONFIRMATION_REFETCH_BASE_RETRY_MS * 2 ** (attempt - 1))
     try {
-      const result = await sdk().session.messages({
-        sessionID: sessionId,
-        directory: directory ?? undefined,
-        limit: SEND_CONFIRMATION_REFETCH_LIMIT,
-      })
-      const records = (assertSdkSuccess(result, "session.messages") ?? [])
+      const records = (isCodexSessionId(sessionId)
+        ? await opencodeClient.getSessionMessages(sessionId, SEND_CONFIRMATION_REFETCH_LIMIT)
+        : (assertSdkSuccess(await sdk().session.messages({
+          sessionID: sessionId,
+          directory: directory ?? undefined,
+          limit: SEND_CONFIRMATION_REFETCH_LIMIT,
+        }), "session.messages") ?? []))
         .filter((record: { info?: { id?: string } }) => !!record?.info?.id) as Array<{ info: Message; parts?: Part[] }>
       if (records.some((record) => record.info.id === messageID)) {
         return records
@@ -1535,6 +1543,10 @@ export async function abortCurrentOperation(sessionId: string): Promise<void> {
   // worktree than the UI's current directory could never be aborted).
   const { directory } = dirStoreForSession(sessionId)
   try {
+    if (isCodexSessionId(sessionId)) {
+      await opencodeClient.abortSession(sessionId)
+      return
+    }
     await sdk().session.abort({ sessionID: sessionId, directory })
   } catch (error) {
     console.error("[session-actions] abort failed", error)
@@ -1551,6 +1563,20 @@ export async function respondToPermission(
   response: "once" | "always" | "reject",
   directoryOverride?: string,
 ): Promise<void> {
+  if (isCodexSessionId(sessionId)) {
+    const rawRequestId = decodeCodexReferenceId(requestId)
+    if (!rawRequestId) throw new Error("Invalid Codex approval id")
+    const decision = response === "always" ? "acceptForSession" : response === "once" ? "accept" : "decline"
+    const result = await agentClient.respondToApproval({
+      backend: "codex",
+      directory: directoryOverride ?? getSessionDirectory(sessionId) ?? dir(),
+      requestId: rawRequestId,
+      result: { decision },
+    })
+    if (!result.ok) throw new Error(result.error.message)
+    removePermissionRequestFromChildStores(sessionId, requestId)
+    return
+  }
   await waitForConnectionOrThrow()
   const directory = directoryOverride
     || resolveDirectoryForBlockingRequest("permission", sessionId, requestId)
@@ -1573,6 +1599,9 @@ export async function dismissPermission(
   sessionId: string,
   requestId: string,
 ): Promise<void> {
+  if (isCodexSessionId(sessionId)) {
+    return respondToPermission(sessionId, requestId, "reject")
+  }
   await waitForConnectionOrThrow()
   const directory = resolveDirectoryForBlockingRequest("permission", sessionId, requestId)
     || getSessionDirectory(sessionId)
@@ -1669,6 +1698,34 @@ export async function respondToQuestion(
   requestId: string,
   answers: string[] | string[][],
 ): Promise<void> {
+  if (isCodexSessionId(sessionId)) {
+    const rawRequestId = decodeCodexReferenceId(requestId)
+    if (!rawRequestId) throw new Error("Invalid Codex user-input request id")
+    const normalizedAnswers = answers.length === 0
+      ? []
+      : Array.isArray(answers[0])
+        ? answers as string[][]
+        : [answers as string[]]
+    let request: QuestionRequest | undefined
+    for (const [, store] of _childStores?.children ?? []) {
+      request = (store.getState().question?.[sessionId] ?? []).find((candidate) => candidate.id === requestId)
+      if (request) break
+    }
+    const answerMap: { [key: string]: JsonValue } = {}
+    request?.questions.forEach((question, index) => {
+      const id = (question as QuestionInfoWithCodexId).id
+      if (id) answerMap[id] = { answers: normalizedAnswers[index] ?? [] }
+    })
+    const result = await agentClient.respondToUserInput({
+      backend: "codex",
+      directory: getSessionDirectory(sessionId) ?? dir(),
+      requestId: rawRequestId,
+      result: { answers: answerMap } satisfies JsonObject,
+    })
+    if (!result.ok) throw new Error(result.error.message)
+    removeQuestionRequestFromChildStores(sessionId, requestId)
+    return
+  }
   await waitForConnectionOrThrow()
   const directory = resolveDirectoryForBlockingRequest("question", sessionId, requestId)
     || getSessionDirectory(sessionId)
@@ -1700,6 +1757,9 @@ export async function rejectQuestion(
   sessionId: string,
   requestId: string,
 ): Promise<void> {
+  if (isCodexSessionId(sessionId)) {
+    return respondToQuestion(sessionId, requestId, [])
+  }
   await waitForConnectionOrThrow()
   const directory = resolveDirectoryForBlockingRequest("question", sessionId, requestId)
     || getSessionDirectory(sessionId)
@@ -1918,8 +1978,9 @@ export async function refetchSessionMessages(sessionId: string): Promise<void> {
 
   // Actions can run in isolated tests before SyncProvider binds the shared
   // loader. The application runtime always takes the shared path above.
-  const result = await sdk().session.messages({ sessionID: sessionId, directory, limit: MESSAGE_REFETCH_LIMIT })
-  const records = (assertSdkSuccess(result, "session.messages") ?? [])
+  const records = (isCodexSessionId(sessionId)
+    ? await opencodeClient.getSessionMessages(sessionId, MESSAGE_REFETCH_LIMIT)
+    : (assertSdkSuccess(await sdk().session.messages({ sessionID: sessionId, directory, limit: MESSAGE_REFETCH_LIMIT }), "session.messages") ?? []))
     .filter((record: { info?: { id?: string } }) => !!record?.info?.id)
   if (records.length === 0) return
 

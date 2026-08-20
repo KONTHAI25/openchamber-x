@@ -112,6 +112,8 @@ import { createOpenChamberSessionService } from './lib/openchamber-sessions/rout
 import { createScheduledTaskService } from './lib/scheduled-tasks/service.js';
 import { createOpenChamberControlService } from './lib/openchamber-control/service.js';
 import { OpenChamberControlError } from './lib/openchamber-control/error.js';
+import { createCodexAppServerRuntime } from './lib/codex/index.js';
+import { registerAgentBackendRoutes } from './lib/agents/routes.js';
 import webPush from 'web-push';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -163,6 +165,7 @@ const SSE_PATH_PREFIXES = [
   '/api/notifications/stream',
   '/api/openchamber/events',
   '/api/openchamber/realtime-proxy/sse',
+  '/api/agents/events',
 ];
 
 function shouldSkipCompression(req, res) {
@@ -1027,6 +1030,15 @@ const clientPairingRuntime = createClientPairingRuntime({
 const featureRoutesRuntime = createFeatureRoutesRuntime({
   clientReloadDelayMs: CLIENT_RELOAD_DELAY_MS,
 });
+const codexAppServerRuntime = createCodexAppServerRuntime({
+  executable: process.env.CODEX_BINARY?.trim() || 'codex',
+  clientInfo: {
+    name: 'openchamber',
+    title: 'OpenChamber',
+    version: OPENCHAMBER_VERSION,
+  },
+});
+let agentBackendRoutesRuntime = null;
 const bootstrapRuntime = createBootstrapRuntime({
   createUiAuth,
   registerServerStatusRoutes,
@@ -1443,6 +1455,8 @@ const gracefulShutdownRuntime = createGracefulShutdownRuntime({
   },
   tunnelAuthController,
   scheduledTasksRuntime,
+  codexAppServerRuntime,
+  getAgentBackendRoutesRuntime: () => agentBackendRoutesRuntime,
 });
 
 const gracefulShutdown = (...args) => gracefulShutdownRuntime.gracefulShutdown(...args);
@@ -1892,6 +1906,10 @@ async function main(options = {}) {
     getOpenChamberEventClients: () => uiOpenChamberEventClients,
     writeSseEvent,
     permissionAutoAcceptRuntime,
+  });
+
+  agentBackendRoutesRuntime = registerAgentBackendRoutes(app, {
+    codexRuntime: codexAppServerRuntime,
   });
 
   const startupPipelineResult = await startupPipelineRuntime.run({

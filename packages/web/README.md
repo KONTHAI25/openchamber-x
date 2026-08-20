@@ -17,6 +17,9 @@ curl -fsSL https://raw.githubusercontent.com/openchamber/openchamber/main/script
 Or install manually: `bun add -g @openchamber/web` (or npm, pnpm, yarn).
 
 > **Prerequisites:** [OpenCode CLI](https://opencode.ai) installed, Node.js 22+.
+> Optional Codex sessions require Codex CLI 0.148.0 or newer on the OpenChamber
+> host. Authentication stays in the host CLI; browser and mobile clients never
+> launch Codex locally.
 
 ## Usage
 
@@ -27,6 +30,7 @@ openchamber --lan --port 3000        # Listen on LAN (0.0.0.0)
 openchamber --ui-password secret     # Password-protect UI
 openchamber startup enable           # Start at login as a native service
 OPENCHAMBER_UI_PASSWORD=secret openchamber startup enable # Save service password env
+CODEX_BINARY=/custom/path/to/codex openchamber # Optional Codex executable override
 openchamber startup status           # Show startup service status
 openchamber startup disable          # Remove startup service
 openchamber tunnel help              # Tunnel lifecycle commands

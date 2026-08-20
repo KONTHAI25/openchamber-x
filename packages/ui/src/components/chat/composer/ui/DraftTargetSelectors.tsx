@@ -28,6 +28,7 @@ import { createWorktreeDraft } from '@/lib/worktreeSessionCreator';
 import type { Theme } from '@/types/theme';
 import { normalizePath } from '../attachments/filePaths';
 import { getProjectDisplayLabel, type DraftTargetProject } from '../state/useDraftTarget';
+import type { AgentBackend } from '@/lib/agents/contracts';
 
 export interface BranchOption {
     value: string;
@@ -45,8 +46,11 @@ export interface DraftTargetProps {
     worktreeBranchOptions: readonly BranchOption[];
     branchItems: readonly BranchOption[];
     showBranchSelector: boolean;
+    selectedBackend: AgentBackend;
+    codexAvailable: boolean;
     onProjectChange: (projectId: string) => void;
     onDirectoryChange: (directory: string) => void;
+    onBackendChange: (backend: AgentBackend) => void;
     theme: Theme;
 }
 
@@ -99,8 +103,11 @@ export function DraftTargetSelectors(props: DraftTargetProps) {
         worktreeBranchOptions,
         branchItems,
         showBranchSelector,
+        selectedBackend,
+        codexAvailable,
         onProjectChange,
         onDirectoryChange,
+        onBackendChange,
         theme,
     } = props;
 
@@ -176,17 +183,33 @@ export function DraftTargetSelectors(props: DraftTargetProps) {
                     </SelectContent>
                 </Select>
             ) : null}
+
+            <Select value={selectedBackend} onValueChange={onBackendChange}>
+                <SelectTrigger
+                    size="sm"
+                    aria-label={t('settings.projects.page.agentBackend.title')}
+                    className="h-7 min-w-0 w-fit max-w-[9rem] border-transparent bg-transparent px-1.5 hover:bg-transparent data-[popup-open]:bg-transparent"
+                >
+                    <SelectValue>{t(selectedBackend === 'codex'
+                        ? 'settings.projects.page.agentBackend.option.codex'
+                        : 'settings.projects.page.agentBackend.option.opencode')}</SelectValue>
+                </SelectTrigger>
+                <SelectContent fitContent>
+                    <SelectItem value="opencode">{t('settings.projects.page.agentBackend.option.opencode')}</SelectItem>
+                    <SelectItem value="codex" disabled={!codexAvailable}>{t('settings.projects.page.agentBackend.option.codex')}</SelectItem>
+                </SelectContent>
+            </Select>
         </div>
     );
 }
 
 /** Mobile: buttons that open the bottom sheets below. */
 export function MobileDraftTargetTriggers(
-    props: Pick<DraftTargetProps, 'selectedProject' | 'selectedBranchLabel' | 'showBranchSelector' | 'theme'>
-        & { onOpenPicker: (picker: 'project' | 'branch') => void },
+    props: Pick<DraftTargetProps, 'selectedProject' | 'selectedBranchLabel' | 'showBranchSelector' | 'selectedBackend' | 'theme'>
+        & { onOpenPicker: (picker: 'project' | 'branch' | 'backend') => void },
 ) {
     const { t } = useI18n();
-    const { selectedProject, selectedBranchLabel, showBranchSelector, theme, onOpenPicker } = props;
+    const { selectedProject, selectedBranchLabel, showBranchSelector, selectedBackend, theme, onOpenPicker } = props;
 
     return (
         <div className="mb-1.5 flex min-w-0 items-center gap-x-2 px-0.5">
@@ -208,6 +231,16 @@ export function MobileDraftTargetTriggers(
                     <Icon name="arrow-down-s" className="h-3.5 w-3.5 flex-shrink-0 text-muted-foreground" />
                 </button>
             ) : null}
+            <button
+                type="button"
+                className="inline-flex h-7 min-w-0 flex-shrink cursor-pointer items-center gap-1 rounded-lg px-1.5 typography-micro font-medium text-foreground/80 hover:bg-[var(--interactive-hover)]"
+                onClick={() => onOpenPicker('backend')}
+            >
+                <span>{t(selectedBackend === 'codex'
+                    ? 'settings.projects.page.agentBackend.option.codex'
+                    : 'settings.projects.page.agentBackend.option.opencode')}</span>
+                <Icon name="arrow-down-s" className="h-3.5 w-3.5 flex-shrink-0 text-muted-foreground" />
+            </button>
         </div>
     );
 }
@@ -218,8 +251,8 @@ export function MobileDraftTargetTriggers(
  */
 export function MobileDraftTargetSheets(
     props: DraftTargetProps & {
-        openPicker: 'project' | 'branch' | null;
-        onOpenPickerChange: (picker: 'project' | 'branch' | null) => void;
+        openPicker: 'project' | 'branch' | 'backend' | null;
+        onOpenPickerChange: (picker: 'project' | 'branch' | 'backend' | null) => void;
         query: string;
         onQueryChange: (query: string) => void;
     },
@@ -236,6 +269,9 @@ export function MobileDraftTargetSheets(
         branchItems,
         onProjectChange,
         onDirectoryChange,
+        selectedBackend,
+        codexAvailable,
+        onBackendChange,
         openPicker,
         onOpenPickerChange,
         query,
@@ -353,6 +389,34 @@ export function MobileDraftTargetSheets(
                             );
                         })()}
                     </div>
+                </div>
+            </MobileOverlayPanel>
+            <MobileOverlayPanel
+                open={openPicker === 'backend'}
+                title={t('settings.projects.page.agentBackend.title')}
+                onClose={() => onOpenPickerChange(null)}
+            >
+                <div className="flex flex-col gap-1 px-3 pb-4 pt-1">
+                    {(['opencode', 'codex'] as const).map((backend) => {
+                        const disabled = backend === 'codex' && !codexAvailable;
+                        return (
+                            <button
+                                key={backend}
+                                type="button"
+                                disabled={disabled}
+                                className="flex w-full cursor-pointer items-center gap-2 rounded-lg px-2 py-2.5 text-left typography-ui-label hover:bg-[var(--interactive-hover)] disabled:cursor-not-allowed disabled:opacity-50"
+                                onClick={() => {
+                                    onBackendChange(backend);
+                                    onOpenPickerChange(null);
+                                }}
+                            >
+                                <span className="min-w-0 flex-1">{t(backend === 'codex'
+                                    ? 'settings.projects.page.agentBackend.option.codex'
+                                    : 'settings.projects.page.agentBackend.option.opencode')}</span>
+                                {backend === selectedBackend ? <Icon name="check" className="h-4 w-4 flex-shrink-0 text-muted-foreground" /> : null}
+                            </button>
+                        );
+                    })}
                 </div>
             </MobileOverlayPanel>
         </>

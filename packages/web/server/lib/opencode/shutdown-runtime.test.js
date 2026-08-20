@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { createGracefulShutdownRuntime } from './shutdown-runtime.js';
 
-const createRuntime = (server) => createGracefulShutdownRuntime({
+const createRuntime = (server, overrides = {}) => createGracefulShutdownRuntime({
   process: { exit: vi.fn() },
   shutdownTimeoutMs: 1000,
   getExitOnShutdown: () => false,
@@ -30,6 +30,7 @@ const createRuntime = (server) => createGracefulShutdownRuntime({
   getActiveTunnelController: () => null,
   setActiveTunnelController: vi.fn(),
   tunnelAuthController: { clearActiveTunnel: vi.fn() },
+  ...overrides,
 });
 
 describe('graceful shutdown runtime', () => {
@@ -54,5 +55,20 @@ describe('graceful shutdown runtime', () => {
 
     expect(warnSpy).not.toHaveBeenCalledWith('Server close timeout reached, forcing shutdown');
     expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('closes agent routes and stops the Codex runtime', async () => {
+    const closeAgentRoutes = vi.fn();
+    const stopCodex = vi.fn(async () => undefined);
+    const server = { close: vi.fn((callback) => callback()) };
+
+    const runtime = createRuntime(server, {
+      getAgentBackendRoutesRuntime: () => ({ close: closeAgentRoutes }),
+      codexAppServerRuntime: { stop: stopCodex },
+    });
+    await runtime.gracefulShutdown({ exitProcess: false });
+
+    expect(closeAgentRoutes).toHaveBeenCalledOnce();
+    expect(stopCodex).toHaveBeenCalledOnce();
   });
 });

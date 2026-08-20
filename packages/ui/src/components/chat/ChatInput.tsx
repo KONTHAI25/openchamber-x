@@ -82,6 +82,8 @@ import { fetchResponseStyleInstruction } from '@/lib/responseStyle';
 import { wrapSystemReminder } from '@/lib/systemReminder';
 import { getSyncMessages } from '@/sync/sync-refs';
 import { eventMatchesShortcut, getEffectiveShortcutCombo, normalizeCombo } from '@/lib/shortcuts';
+import { createRuntimeAgentClient } from '@/lib/agents/client';
+import type { AgentBackend } from '@/lib/agents/contracts';
 import {
     assignImageAttachmentFilenames,
     buildAttachmentCitationText,
@@ -264,7 +266,7 @@ const ChatInputComponent: React.FC<ChatInputProps> = ({ onOpenSettings, scrollTo
     const closeAutocomplete = React.useCallback(() => setOpenAutocomplete(null), []);
     const [mobileControlsPanel, setMobileControlsPanel] = React.useState<MobileControlsPanel>(null);
     const [mobileAttachMenuOpen, setMobileAttachMenuOpen] = React.useState(false);
-    const [mobileDraftPicker, setMobileDraftPicker] = React.useState<'project' | 'branch' | null>(null);
+    const [mobileDraftPicker, setMobileDraftPicker] = React.useState<'project' | 'branch' | 'backend' | null>(null);
     const [mobileDraftPickerQuery, setMobileDraftPickerQuery] = React.useState('');
     // Message history navigation state (up/down arrow to recall previous messages)
     const composerRef = React.useRef<ComposerEditorHandle>(null);
@@ -324,6 +326,7 @@ const ChatInputComponent: React.FC<ChatInputProps> = ({ onOpenSettings, scrollTo
         s.newSessionDraft?.open ? s.newSessionDraft.permissionAutoAcceptEnabled === true : false
     ));
     const setNewSessionDraftTarget = useSessionUIStore((s) => s.setNewSessionDraftTarget);
+    const setNewSessionDraftBackend = useSessionUIStore((s) => s.setNewSessionDraftBackend);
     const setDraftPermissionAutoAcceptEnabled = useSessionUIStore((s) => s.setDraftPermissionAutoAcceptEnabled);
     const openNewSessionDraft = useSessionUIStore((s) => s.openNewSessionDraft);
     const abortPromptSessionId = useSessionUIStore((s) => s.abortPromptSessionId);
@@ -2350,6 +2353,25 @@ const ChatInputComponent: React.FC<ChatInputProps> = ({ onOpenSettings, scrollTo
     // panel, so these keep their place above the composer there.
     const composerStatusExtrasEnabled = isVSCode || isMobile;
     const showDraftTargetSelectors = newSessionDraftOpen && !isVSCode;
+    const selectedDraftBackend: AgentBackend = newSessionDraft?.backend ?? 'opencode';
+    const agentClient = React.useMemo(() => createRuntimeAgentClient(), []);
+    const [codexAvailable, setCodexAvailable] = React.useState(false);
+
+    React.useEffect(() => {
+        if (!showDraftTargetSelectors) return;
+        const controller = new AbortController();
+        void agentClient.getStatus('codex', controller.signal).then((result) => {
+            if (!controller.signal.aborted) {
+                setCodexAvailable(result.ok && result.data.status === 'available');
+            }
+        });
+        return () => controller.abort();
+    }, [agentClient, showDraftTargetSelectors]);
+
+    const handleDraftBackendChange = React.useCallback((backend: AgentBackend) => {
+        if (backend === 'codex' && !codexAvailable) return;
+        setNewSessionDraftBackend(backend);
+    }, [codexAvailable, setNewSessionDraftBackend]);
 
     // Which project and directory a new session will target.
     const {
@@ -2629,8 +2651,11 @@ const ChatInputComponent: React.FC<ChatInputProps> = ({ onOpenSettings, scrollTo
                         worktreeBranchOptions={worktreeBranchOptions}
                         branchItems={draftBranchItems}
                         showBranchSelector={shouldShowDraftBranchSelector}
+                        selectedBackend={selectedDraftBackend}
+                        codexAvailable={codexAvailable}
                         onProjectChange={handleDraftProjectChange}
                         onDirectoryChange={handleDraftDirectoryChange}
+                        onBackendChange={handleDraftBackendChange}
                         theme={currentTheme}
                     />
                 ) : null}
@@ -2639,6 +2664,7 @@ const ChatInputComponent: React.FC<ChatInputProps> = ({ onOpenSettings, scrollTo
                         selectedProject={selectedDraftProject}
                         selectedBranchLabel={selectedDraftBranchLabel}
                         showBranchSelector={shouldShowDraftBranchSelector}
+                        selectedBackend={selectedDraftBackend}
                         theme={currentTheme}
                         onOpenPicker={setMobileDraftPicker}
                     />
@@ -3020,8 +3046,11 @@ const ChatInputComponent: React.FC<ChatInputProps> = ({ onOpenSettings, scrollTo
                 worktreeBranchOptions={worktreeBranchOptions}
                 branchItems={draftBranchItems}
                 showBranchSelector={shouldShowDraftBranchSelector}
+                selectedBackend={selectedDraftBackend}
+                codexAvailable={codexAvailable}
                 onProjectChange={handleDraftProjectChange}
                 onDirectoryChange={handleDraftDirectoryChange}
+                onBackendChange={handleDraftBackendChange}
                 theme={currentTheme}
                 openPicker={mobileDraftPicker}
                 onOpenPickerChange={setMobileDraftPicker}

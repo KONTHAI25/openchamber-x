@@ -88,6 +88,9 @@ import { clearLastActiveSession, persistLastActiveSession, readLastActiveSession
 import { persistWorktreeTopology, readPersistedWorktreeTopology } from "./worktree-topology-cache"
 import { rememberRuntimeLiveStatus } from "./runtime-live-memory"
 import { contextTokensFromBreakdown } from "@/stores/utils/tokenUtils"
+import { isVSCodeRuntime } from "@/lib/desktop"
+import { getAgentBackendPreference } from "@/lib/agents/preferences"
+import type { AgentBackend } from "@/lib/agents/contracts"
 
 export type { AttachedFile }
 
@@ -259,6 +262,8 @@ function notifyMessageSent(sessionId: string): void {
 
 export type NewSessionDraftState = {
   open: boolean
+  /** Runtime used when this draft is materialized. Existing sessions keep their encoded backend. */
+  backend?: AgentBackend
   selectedProjectId?: string | null
   directoryOverride: string | null
   permissionAutoAcceptEnabled?: boolean
@@ -318,6 +323,7 @@ export type SessionUIState = {
   openNewSessionDraft: (options?: Partial<NewSessionDraftState> & { automatic?: boolean }) => void
   closeNewSessionDraft: () => void
   setNewSessionDraftTarget: (target: { projectId?: string | null; selectedProjectId?: string | null; directoryOverride?: string | null }, options?: { force?: boolean }) => void
+  setNewSessionDraftBackend: (backend: AgentBackend) => void
   setDraftPreserveDirectoryOverride: (value: boolean) => void
   setDraftPermissionAutoAcceptEnabled: (enabled: boolean) => void
   setDraftProjectContextPin: (kind: "note" | "plan", id: string, pinned: boolean) => void
@@ -549,6 +555,7 @@ const activateConfigForDirectory = async (directory: string | null | undefined):
 
 const DEFAULT_DRAFT: NewSessionDraftState = {
   open: false,
+  backend: "opencode",
   directoryOverride: null,
   parentID: null,
 }
@@ -729,13 +736,24 @@ export async function materializeOpenDraftSession(selection: {
   await waitForWorktreeBootstrapIfConfigured(draftDirectoryOverride, draftProjectId)
 
   const draftPins = draft.projectContextPins ?? { notes: [], plans: [] }
+  const backend: AgentBackend = isVSCodeRuntime()
+    ? "opencode"
+    : (draft.backend ?? getAgentBackendPreference(draftDirectoryOverride ?? ""))
   const created = await store.createSession(
     draft.title,
     draftDirectoryOverride,
     draft.parentID ?? null,
-    draftPins.notes.length > 0 || draftPins.plans.length > 0
-      ? { openchamber: { project_context_pins: draftPins } }
-      : undefined,
+    {
+      openchamber: {
+        agent_backend: backend,
+        ...(backend !== "codex" || selection.providerID === "openai" || selection.modelID.startsWith("gpt-")
+          ? { model_id: selection.modelID }
+          : {}),
+        ...(draftPins.notes.length > 0 || draftPins.plans.length > 0
+          ? { project_context_pins: draftPins }
+          : {}),
+      },
+    },
   )
   if (!created?.id) throw new Error("Failed to create session")
 
@@ -1025,6 +1043,9 @@ export const useSessionUIStore = create<SessionUIState>()((set, get) => ({
 
     const nextDraft: NewSessionDraftState = {
       open: true,
+      backend: isVSCodeRuntime()
+        ? "opencode"
+        : (options?.backend ?? getAgentBackendPreference(directory ?? "")),
       selectedProjectId: selectedProject?.id ?? null,
       directoryOverride: directory,
       permissionAutoAcceptEnabled: options?.permissionAutoAcceptEnabled === true,
@@ -1099,8 +1120,9 @@ export const useSessionUIStore = create<SessionUIState>()((set, get) => ({
     ) {
       return
     }
-    const nextDraft: NewSessionDraftState = {
+      const nextDraft: NewSessionDraftState = {
         open: false,
+        backend: "opencode",
         selectedProjectId: null,
         directoryOverride: null,
         pendingWorktreeRequestId: null,
@@ -1136,6 +1158,17 @@ export const useSessionUIStore = create<SessionUIState>()((set, get) => ({
       useDirectoryStore.getState().setDirectory(nextDirectory)
     }
   },
+
+  setNewSessionDraftBackend: (backend) =>
+    set((s) => {
+      if (!s.newSessionDraft?.open) return s
+      return {
+        newSessionDraft: {
+          ...s.newSessionDraft,
+          backend: isVSCodeRuntime() ? "opencode" : backend,
+        },
+      }
+    }),
 
   setDraftPreserveDirectoryOverride: (value) =>
     set((s) => {

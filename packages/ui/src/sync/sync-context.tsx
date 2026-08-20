@@ -73,6 +73,7 @@ import { isFilesystemError } from "@/lib/api/files-errors"
 import { formatMessage, useI18nStore } from "@/lib/i18n"
 import { listGlobalSessionPages } from "@/stores/globalSessions"
 import { areRequestArraysReferentiallyEqual, collectScopedBlockingRequests } from "./scoped-blocking-requests"
+import { createRuntimeAgentClient } from "@/lib/agents/client"
 import { EMPTY_USER_MESSAGE_HISTORY_SNAPSHOT, buildUserMessageHistorySnapshot, type UserMessageHistorySnapshot } from "./user-message-history"
 import {
   EMPTY_SESSION_MESSAGE_LOAD_STATE,
@@ -81,6 +82,8 @@ import {
   setImperativeSessionMessageLoader,
   type SessionMessageLoadState,
 } from "./session-message-loader"
+
+const agentClient = createRuntimeAgentClient()
 
 // ---------------------------------------------------------------------------
 // Context
@@ -2327,6 +2330,57 @@ export function SyncProvider(props: {
       pipeline.cleanup()
     }
   }, [props.sdk, childStores, routingIndex, messageStreamTransport, runtimeKey, triggerDirectoryResync])
+
+  // Codex app-server remains a server-side stdio child process. Its stable SSE
+  // events are mapped into the existing reducer here, keeping the high-volume
+  // message path identical across web, Electron, and remote/mobile clients.
+  useEffect(() => {
+    if (isVSCodeRuntime()) return
+    const controller = new AbortController()
+    const dispatchCodexEvent = (directory: string, event: Event) => {
+      const batch = createDirectoryEventBatch()
+      try {
+        handleEvent(
+          directory,
+          event,
+          childStores,
+          routingIndex,
+          runtimeKey,
+          false,
+          currentDirectoryRef.current,
+          batch,
+        )
+      } finally {
+        publishDirectoryEventBatch(batch)
+      }
+    }
+    const stream = agentClient.subscribeEvents({
+      backend: "codex",
+      directory: props.directory,
+      signal: controller.signal,
+      onEvent: (agentEvent) => {
+        const directory = agentEvent.directory || props.directory
+        const mappedInfo = (agentEvent.event.properties as { info?: Session }).info
+        if (agentEvent.event.type === "session.updated" && mappedInfo?.id && !mappedInfo.directory) {
+          void opencodeClient.getSession(mappedInfo.id, directory).then((info) => {
+            if (controller.signal.aborted) return
+            dispatchCodexEvent(directory, {
+              ...agentEvent.event,
+              properties: { ...agentEvent.event.properties, sessionID: info.id, info },
+            } as Event)
+          }).catch(() => {
+            // The next list/bootstrap pass remains authoritative.
+          })
+          return
+        }
+        dispatchCodexEvent(directory, agentEvent.event)
+      },
+    })
+    return () => {
+      controller.abort()
+      stream.close()
+    }
+  }, [childStores, props.directory, routingIndex, runtimeKey])
 
   useEffect(() => {
     let stopped = false

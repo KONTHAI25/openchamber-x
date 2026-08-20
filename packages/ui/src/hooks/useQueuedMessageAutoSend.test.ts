@@ -274,6 +274,7 @@ describe('buildQueuedAutoSendPayload', () => {
     expect(payload).not.toBeNull();
     await sendQueuedAutoSendPayload({
       runtimeKey: 'runtime-original',
+      backend: 'opencode',
       sessionId: 'session-original',
       directory: '/repo',
     }, payload!, {
@@ -297,6 +298,7 @@ describe('buildQueuedAutoSendPayload', () => {
       {
         target: {
           runtimeKey: 'runtime-original',
+          backend: 'opencode',
           sessionId: 'session-original',
           directory: '/repo',
         },

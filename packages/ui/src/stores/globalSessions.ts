@@ -3,6 +3,11 @@ import { runBackgroundNetworkTask } from '@/lib/background-network';
 import { retry } from "@/sync/retry";
 import { stripSessionListDetails } from "@/sync/sanitize";
 import { startSessionLoadPerformanceEvent } from "@/sync/session-load-performance";
+import { createRuntimeAgentClient } from "@/lib/agents/client";
+import { mapCodexThread, type CodexThreadRecord } from "@/lib/agents/opencode-compat";
+import { getAgentBackendPreference, hasCodexDirectoryBeenUsed } from "@/lib/agents/preferences";
+
+const agentClient = createRuntimeAgentClient();
 
 export type GlobalSessionRecord = Session & {
     project?: {
@@ -202,6 +207,44 @@ export async function listGlobalSessionPages(
         if (appended === 0) break;
 
         cursor = nextCursor;
+    }
+
+    // Codex app-server has its own thread index. Merge it at the same boundary
+    // as OpenCode pagination so every sidebar/cache consumer sees one stable
+    // Session shape without learning a second protocol.
+    if (
+        options.directory
+        && (getAgentBackendPreference(options.directory) === "codex" || hasCodexDirectoryBeenUsed(options.directory))
+    ) {
+        const archivedQueries = options.archived && options.narrowToArchived === false
+            ? [false, true]
+            : [options.archived];
+        const codexSessions: GlobalSessionRecord[] = [];
+        for (const archived of archivedQueries) {
+            const result = await agentClient.listThreads({
+                backend: "codex",
+                directory: options.directory,
+                archived,
+            });
+            if (!result.ok) continue;
+            for (const thread of result.data) {
+                const session = mapCodexThread({
+                    id: thread.id,
+                    cwd: thread.directory,
+                    name: thread.title,
+                    status: thread.status,
+                    createdAt: thread.createdAt,
+                    updatedAt: thread.updatedAt,
+                    archivedAt: thread.archivedAt,
+                } satisfies CodexThreadRecord) as GlobalSessionRecord;
+                if (seenIds.has(session.id)) continue;
+                seenIds.add(session.id);
+                if (options.archived && narrowToArchived && !isArchivedSession(session)) continue;
+                all.push(session);
+                codexSessions.push(session);
+            }
+        }
+        if (codexSessions.length > 0) options.onPage?.(codexSessions);
     }
 
     return all;

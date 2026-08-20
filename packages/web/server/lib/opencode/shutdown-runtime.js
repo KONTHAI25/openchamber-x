@@ -30,6 +30,8 @@ export const createGracefulShutdownRuntime = (dependencies) => {
     getActiveTunnelController,
     setActiveTunnelController,
     tunnelAuthController,
+    codexAppServerRuntime,
+    getAgentBackendRoutesRuntime,
   } = dependencies;
 
   let shutdownPromise = null;
@@ -48,6 +50,8 @@ export const createGracefulShutdownRuntime = (dependencies) => {
     sessionGoalRuntime?.stop?.();
     contextObligatoryRuntime?.stop?.();
     scheduledTasksRuntime?.stop?.();
+    getAgentBackendRoutesRuntime?.()?.close?.();
+    await codexAppServerRuntime?.stop?.().catch(() => undefined);
 
     const healthCheckInterval = getHealthCheckInterval();
     if (healthCheckInterval) {

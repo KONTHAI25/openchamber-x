@@ -37,12 +37,57 @@ import {
   recordProviderSuccess,
   recordProviderError,
 } from "./provider-tracker";
+import { createRuntimeAgentClient } from "@/lib/agents/client";
+import type { AgentInput, AgentThread } from "@/lib/agents/contracts";
+import {
+  decodeCodexSessionId,
+  isCodexSessionId,
+  mapCodexThread,
+  type CodexThreadRecord,
+} from "@/lib/agents/opencode-compat";
+import { markCodexDirectoryUsed } from "@/lib/agents/preferences";
 
 // Use relative path by default (works with both dev and nginx proxy server)
 // Can be overridden with VITE_OPENCODE_URL for absolute URLs in special deployments
 const DEFAULT_BASE_URL = import.meta.env.VITE_OPENCODE_URL || "/api";
 const CONFIG_CACHE_TTL_MS = 10_000;
 const OPENCODE_HEALTH_TIMEOUT_MS = 4_000;
+const agentClient = createRuntimeAgentClient();
+
+const unwrapAgentResult = <T>(result: import("@/lib/agents/contracts").AgentResult<T>, operation: string): T => {
+  if (result.ok) return result.data;
+  throw new Error(`${operation} failed: ${result.error.message}`);
+};
+
+const mapAgentThreadToSession = (thread: AgentThread): Session => mapCodexThread({
+  id: thread.id,
+  cwd: thread.directory,
+  name: thread.title,
+  status: thread.status,
+  createdAt: thread.createdAt,
+  updatedAt: thread.updatedAt,
+  archivedAt: thread.archivedAt,
+} satisfies CodexThreadRecord);
+
+const codexThreadId = (sessionId: string): string => {
+  const decoded = decodeCodexSessionId(sessionId);
+  if (!decoded) throw new Error(`Invalid Codex session id: ${sessionId}`);
+  return decoded;
+};
+
+const metadataBackend = (metadata?: Record<string, unknown>): string | undefined => {
+  const root = metadata?.openchamber;
+  if (!root || typeof root !== "object" || Array.isArray(root)) return undefined;
+  const value = (root as Record<string, unknown>).agent_backend;
+  return typeof value === "string" ? value : undefined;
+};
+
+const metadataModel = (metadata?: Record<string, unknown>): string | undefined => {
+  const root = metadata?.openchamber;
+  if (!root || typeof root !== "object" || Array.isArray(root)) return undefined;
+  const value = (root as Record<string, unknown>).model_id;
+  return typeof value === "string" ? value : undefined;
+};
 
 /**
  * Render an SDK error payload into a short string for Error messages.
@@ -69,6 +114,19 @@ type SdkResult<T> = {
 };
 
 type DirectoryAvailability = "available" | "missing" | "unknown";
+
+/**
+ * Result of `listSessions()`. The OpenCode session list is authoritative on
+ * its own, but the Codex thread list is a separate backend fetch: a failure
+ * there must not be conflated with "no Codex sessions exist", otherwise a
+ * caller replacing state would erase existing Codex sessions. `codexFailed`
+ * lets callers keep prior Codex-scope state when the list could not be
+ * fetched.
+ */
+export type ListSessionsResult = {
+  sessions: Session[];
+  codexFailed: boolean;
+};
 
 const isMissingDirectoryError = (error: unknown): boolean => {
   if (error instanceof FilesystemError) {
@@ -277,6 +335,7 @@ class OpencodeService {
   private configCache: Map<string, { config: Config; expiresAt: number }> = new Map();
   private configCacheGeneration = 0;
   private listDirectoryCache: Map<string, { entries: FilesystemEntry[]; expiresAt: number }> = new Map();
+  private activeCodexTurns: Map<string, string> = new Map();
 
   constructor(baseUrl: string = DEFAULT_BASE_URL) {
     const runtimeBase = resolveRuntimeBaseUrl();
@@ -486,8 +545,11 @@ class OpencodeService {
 
     if (!candidates.size) {
       try {
-        const sessions = await this.listSessions();
-        sessions.forEach((session) => addCandidate(session.directory));
+        const result = await this.listSessions();
+        // A Codex list failure still leaves the authoritative OpenCode list;
+        // only the Codex-scope fetch is degraded. Directory candidates are
+        // best-effort here, so the flag does not change this path's behavior.
+        result.sessions.forEach((session) => addCandidate(session.directory));
       } catch (error) {
         console.debug('Failed to inspect sessions for system info:', error);
       }
@@ -547,15 +609,30 @@ class OpencodeService {
   }
 
   // Session Management
-  async listSessions(): Promise<Session[]> {
+  async listSessions(): Promise<ListSessionsResult> {
     const response = await this.client.session.list(
       this.currentDirectory ? { directory: this.currentDirectory } : undefined
     );
-    return Array.isArray(response.data) ? response.data : [];
+    const openCodeSessions = Array.isArray(response.data) ? response.data : [];
+    if (!this.currentDirectory) return { sessions: openCodeSessions, codexFailed: false };
+    const codex = await agentClient.listThreads({ backend: 'codex', directory: this.currentDirectory });
+    return codex.ok
+      ? { sessions: [...openCodeSessions, ...codex.data.map(mapAgentThreadToSession)], codexFailed: false }
+      : { sessions: openCodeSessions, codexFailed: true };
   }
 
   async createSession(params?: { parentID?: string; title?: string; metadata?: Record<string, unknown> }, directory?: string | null): Promise<Session> {
     const requestDirectory = this.normalizeCandidatePath(directory) ?? this.currentDirectory;
+    if (metadataBackend(params?.metadata) === 'codex') {
+      if (!requestDirectory) throw new Error('Codex session creation requires a project directory');
+      const created = unwrapAgentResult(await agentClient.startThread({
+        backend: 'codex',
+        directory: requestDirectory,
+        modelId: metadataModel(params?.metadata),
+      }), 'thread/start');
+      markCodexDirectoryUsed(requestDirectory);
+      return mapAgentThreadToSession(created);
+    }
     const response = await this.client.session.create({
       ...(requestDirectory ? { directory: requestDirectory } : {}),
       parentID: params?.parentID,
@@ -567,6 +644,14 @@ class OpencodeService {
 
   async getSession(id: string, directory?: string | null): Promise<Session> {
     const requestDirectory = this.normalizeCandidatePath(directory) ?? this.currentDirectory;
+    if (isCodexSessionId(id)) {
+      const thread = unwrapAgentResult(await agentClient.readThread({
+        backend: 'codex',
+        directory: requestDirectory ?? '',
+        threadId: codexThreadId(id),
+      }), 'thread/read');
+      return mapAgentThreadToSession(thread);
+    }
     const response = await this.client.session.get({
       sessionID: id,
       ...(requestDirectory ? { directory: requestDirectory } : {})
@@ -576,6 +661,15 @@ class OpencodeService {
 
   async deleteSession(id: string, directory?: string | null): Promise<boolean> {
     const requestDirectory = this.normalizeCandidatePath(directory) ?? this.currentDirectory;
+    if (isCodexSessionId(id)) {
+      unwrapAgentResult(await agentClient.deleteThread({
+        backend: 'codex',
+        directory: requestDirectory ?? '',
+        threadId: codexThreadId(id),
+      }), 'thread/delete');
+      this.activeCodexTurns.delete(id);
+      return true;
+    }
     const response = await this.client.session.delete({
       sessionID: id,
       ...(requestDirectory ? { directory: requestDirectory } : {}),
@@ -589,6 +683,25 @@ class OpencodeService {
     directory?: string | null,
   ): Promise<Session> {
     const requestDirectory = this.normalizeCandidatePath(directory) ?? this.currentDirectory;
+    if (isCodexSessionId(id)) {
+      const request = {
+        backend: 'codex' as const,
+        directory: requestDirectory ?? '',
+        threadId: codexThreadId(id),
+      };
+      if (patch.time?.archived !== undefined) {
+        const result = patch.time.archived
+          ? await agentClient.archiveThread(request)
+          : await agentClient.unarchiveThread(request);
+        const thread = unwrapAgentResult(result, patch.time.archived ? 'thread/archive' : 'thread/unarchive');
+        if (thread) return mapAgentThreadToSession(thread);
+      }
+      if (patch.title !== undefined) {
+        unwrapAgentResult(await agentClient.setThreadName({ ...request, name: patch.title }), 'thread/name/set');
+      }
+      const current = await this.getSession(id, requestDirectory);
+      return patch.title === undefined ? current : { ...current, title: patch.title };
+    }
     const sdkPatch = {
       ...(patch.title !== undefined ? { title: patch.title } : {}),
       ...(patch.metadata !== undefined ? { metadata: patch.metadata } : {}),
@@ -603,6 +716,14 @@ class OpencodeService {
   }
 
   async getSessionMessages(id: string, limit?: number): Promise<{ info: Message; parts: Part[] }[]> {
+    if (isCodexSessionId(id)) {
+      const snapshot = unwrapAgentResult(await agentClient.readThreadSnapshot({
+        backend: 'codex',
+        directory: this.currentDirectory ?? '',
+        threadId: codexThreadId(id),
+      }), 'thread/read');
+      return limit === undefined ? [...snapshot.messages] : snapshot.messages.slice(-limit);
+    }
     const response = await this.client.session.messages({
       sessionID: id,
       ...(this.currentDirectory ? { directory: this.currentDirectory } : {}),
@@ -612,6 +733,7 @@ class OpencodeService {
   }
 
   async getSessionTodos(sessionId: string): Promise<Array<{ id: string; content: string; status: string; priority: string }>> {
+    if (isCodexSessionId(sessionId)) return [];
     try {
       const response = await this.client.session.todo({
         sessionID: sessionId,
@@ -874,6 +996,51 @@ class OpencodeService {
 
     const requestDirectory = this.normalizeCandidatePath(params.directory ?? null) ?? this.currentDirectory;
 
+    if (isCodexSessionId(params.id)) {
+      const threadId = codexThreadId(params.id);
+      const requestedCodexModel = params.providerID === 'openai' || params.modelID.startsWith('gpt-')
+        ? params.modelID
+        : undefined;
+      const input: AgentInput[] = [];
+      for (const part of parts) {
+        if (part.type === 'text') {
+          if (part.text.trim()) input.push({ type: 'text', text: part.text });
+          continue;
+        }
+        if (part.type === 'file') {
+          if (part.mime.startsWith('image/')) {
+            input.push({ type: 'image', url: part.url });
+          } else {
+            input.push({ type: 'text', text: `[Attached file: ${part.filename ?? 'file'}]\n${part.url}` });
+          }
+        }
+      }
+      const activeTurnId = this.activeCodexTurns.get(params.id);
+      const turn = params.delivery === 'steer' && activeTurnId
+        ? unwrapAgentResult(await agentClient.steerTurn({
+          backend: 'codex',
+          directory: requestDirectory ?? '',
+          threadId,
+          turnId: activeTurnId,
+          input,
+        }), 'turn/steer')
+        : unwrapAgentResult(await agentClient.startTurn({
+          config: {
+            runtimeKey: params.runtimeKey ?? getRuntimeKey(),
+            directory: requestDirectory ?? '',
+            backend: 'codex',
+            sessionId: params.id,
+            ...(requestedCodexModel ? { modelId: requestedCodexModel } : {}),
+          },
+          threadId,
+          input,
+          ...(requestedCodexModel ? { modelId: requestedCodexModel } : {}),
+          clientUserMessageId: messageId,
+        }), 'turn/start');
+      this.activeCodexTurns.set(params.id, turn.id);
+      return messageId;
+    }
+
     if (params.format) {
       console.info('[git-generation][browser] send structured message', {
         sessionId: params.id,
@@ -998,6 +1165,18 @@ class OpencodeService {
   }
 
   async abortSession(id: string): Promise<boolean> {
+    if (isCodexSessionId(id)) {
+      const turnId = this.activeCodexTurns.get(id);
+      if (!turnId) return false;
+      unwrapAgentResult(await agentClient.interruptTurn({
+        backend: 'codex',
+        directory: this.currentDirectory ?? '',
+        threadId: codexThreadId(id),
+        turnId,
+      }), 'turn/interrupt');
+      this.activeCodexTurns.delete(id);
+      return true;
+    }
     const response = await this.client.session.abort(
       {
         sessionID: id,
@@ -1019,6 +1198,29 @@ class OpencodeService {
   }): Promise<{ info: Message; parts: Part[] }> {
     this.assertRuntimeUnchanged(params.runtimeKey);
     const requestDirectory = this.normalizeCandidatePath(params.directory ?? null) ?? this.currentDirectory;
+    if (isCodexSessionId(params.sessionId)) {
+      const messageId = await this.sendMessage({
+        runtimeKey: params.runtimeKey,
+        id: params.sessionId,
+        providerID: params.model.providerID,
+        modelID: params.model.modelID,
+        text: `$ ${params.command}`,
+        agent: params.agent,
+        messageId: params.messageId,
+        directory: requestDirectory,
+      });
+      return {
+        info: {
+          id: messageId,
+          sessionID: params.sessionId,
+          role: 'user',
+          time: { created: Date.now() },
+          agent: params.agent,
+          model: params.model,
+        },
+        parts: [{ id: `${messageId}-text`, sessionID: params.sessionId, messageID: messageId, type: 'text', text: `$ ${params.command}` }],
+      };
+    }
     const response = await this.client.session.shell({
       sessionID: params.sessionId,
       ...(requestDirectory ? { directory: requestDirectory } : {}),
@@ -1062,6 +1264,16 @@ class OpencodeService {
 
   async forkSession(sessionId: string, messageId?: string, directory?: string | null): Promise<Session> {
     const requestDirectory = this.normalizeCandidatePath(directory) ?? this.currentDirectory;
+    if (isCodexSessionId(sessionId)) {
+      const thread = unwrapAgentResult(await agentClient.forkThread({
+        backend: 'codex',
+        directory: requestDirectory ?? '',
+        threadId: codexThreadId(sessionId),
+        ...(messageId ? { turnId: messageId } : {}),
+      }), 'thread/fork');
+      if (!thread) throw new Error('thread/fork failed: empty response');
+      return mapAgentThreadToSession(thread);
+    }
     const response = await this.client.session.fork({
       sessionID: sessionId,
       ...(requestDirectory ? { directory: requestDirectory } : {}),
